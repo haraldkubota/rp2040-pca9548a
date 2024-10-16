@@ -21,7 +21,6 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Instant, Timer};
-// use embedded_hal_async::i2c::I2c;
 use pca9548a::{Pca9548a, SubBus, BASE_ADDRESS};
 use ssd1306::mode::DisplayConfig;
 use ssd1306::prelude::DisplayRotation;
@@ -99,7 +98,8 @@ async fn core0_task(
     }
 }
 
-// This task does I/O
+
+// This task on core 1 does all I/O
 
 const ROW_PRESSURE: u8 = 2;
 const ROW_TEMP: u8 = 3;
