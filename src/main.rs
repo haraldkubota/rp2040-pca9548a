@@ -1,8 +1,8 @@
 // This example shows how to use a SSD1306 OLED display via I2C to display text
 // GPIO4/5 used for this (I2C0 default pins)
-// 
+//
 // Core 0 does measurements and communicates via a CHANNEL to Core 1
-// Core 1 does display/LED I/O 
+// Core 1 does display/LED I/O
 
 #![no_std]
 #![no_main]
@@ -14,25 +14,27 @@ use defmt::*;
 use embassy_executor::Executor;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::i2c::{self, I2c, Async, Config, InterruptHandler};
+use embassy_rp::i2c::{self, Async, Config, I2c, InterruptHandler};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{I2C0, I2C1};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Timer, Instant};
+use embassy_time::{Instant, Timer};
 // use embedded_hal_async::i2c::I2c;
+use pca9548a::{Pca9548a, SubBus, BASE_ADDRESS};
 use ssd1306::mode::DisplayConfig;
 use ssd1306::prelude::DisplayRotation;
 use ssd1306::size::DisplaySize128x64;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
-use pca9548a::{Pca9548a, BASE_ADDRESS};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 static EXECUTOR0: StaticCell<Executor> = StaticCell::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+static PCA: StaticCell<Pca9548a<Mutex<CriticalSectionRawMutex, I2c<'static, I2C1, Async>>>> =
+    StaticCell::new();
 static CHANNEL: Channel<CriticalSectionRawMutex, DisplayMessage, 1> = Channel::new();
 
 enum DisplayMessage {
@@ -51,14 +53,13 @@ fn main() -> ! {
     let p = embassy_rp::init(Default::default());
     let led = Output::new(p.PIN_26, Level::Low);
 
-
     // Set up I2C0 for the SSD1306 OLED Display
     let i2c0 = i2c::I2c::new_async(p.I2C0, p.PIN_5, p.PIN_4, Irqs, Config::default());
-    
+
     // Set up I2C1 for the PCA9548A which has a BMP280 on Bus 2
     let i2c1 = i2c::I2c::new_async(p.I2C1, p.PIN_3, p.PIN_2, Irqs, Config::default());
-    let pca = Pca9548a::<Mutex<CriticalSectionRawMutex, _>>::new(i2c1, BASE_ADDRESS);
-    let pca_2 = pca.single_subbus(2);
+    let pca = PCA.init(Pca9548a::new(i2c1, BASE_ADDRESS));
+    let subbus = pca.single_subbus(2);
 
     spawn_core1(
         p.CORE1,
@@ -71,33 +72,32 @@ fn main() -> ! {
 
     let executor0 = EXECUTOR0.init(Executor::new());
 
-    executor0.run(|spawner: embassy_executor::Spawner| unwrap!(spawner.spawn(core0_task(pca_2))));
-
+    executor0.run(|spawner: embassy_executor::Spawner| unwrap!(spawner.spawn(core0_task(subbus))));
 }
 
 // This task measures
 
 #[embassy_executor::task]
 // async fn core0_task(i2c1: embassy_rp::i2c::I2c<'static, I2C1, Async>) {
-async fn core0_task(i2c1: I2c<'static, I2C1, Async>) {
-
+async fn core0_task(
+    i2c1: SubBus<'static, Mutex<CriticalSectionRawMutex, I2c<'static, I2C1, Async>>>,
+) {
     info!("Hello from core 0");
 
     let mut bmp280 = bmp280_ehal::BMP280::new(i2c1).expect("BMP280 not found");
     let _ = bmp280.pressure_one_shot(); // Without this, BMP280 is not  well initialized (I get about 650 hPa)
-    
+
     loop {
         CHANNEL.send(DisplayMessage::LedOn).await;
         let pressure = bmp280.pressure_one_shot();
         let temp = bmp280.temp();
         CHANNEL.send(DisplayMessage::LedOff).await;
         CHANNEL.send(DisplayMessage::PAndT(pressure, temp)).await;
-        Timer::after_millis(997).await;    // You can measure how much time the above takes by comparing
-        // now.as_millis() with counting how many times this loop ran.
-        // Above code takes about 3ms including the after_millis() overhead.
+        Timer::after_millis(997).await; // You can measure how much time the above takes by comparing
+                                        // now.as_millis() with counting how many times this loop ran.
+                                        // Above code takes about 3ms including the after_millis() overhead.
     }
 }
-
 
 // This task does I/O
 
@@ -109,9 +109,8 @@ const COL_DATA: u8 = 9;
 
 #[embassy_executor::task]
 async fn core1_task(mut led: Output<'static>, i2c0: embassy_rp::i2c::I2c<'static, I2C0, Async>) {
-
     info!("Hello from core 1");
-    
+
     let interface = I2CDisplayInterface::new(i2c0);
     let mut display =
         Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_terminal_mode();
@@ -138,18 +137,18 @@ async fn core1_task(mut led: Output<'static>, i2c0: embassy_rp::i2c::I2c<'static
             DisplayMessage::LedOff => led.set_low(),
             DisplayMessage::PAndT(p, t) => {
                 info!("p={}, t={}", p, t);
-                let s: &str = buffer.format((p/100.0) as u32); // use hPa (typical range: 990-1040)
+                let s: &str = buffer.format((p / 100.0) as u32); // use hPa (typical range: 990-1040)
                 display.set_position(COL_DATA, ROW_PRESSURE).unwrap();
                 let _ = display.write_str(s);
                 let _ = display.write_str(" ");
                 let s: &str = buffer.format(t as u16);
-                let after_comma_digits = ((t*100.0) as u16) % 100;
+                let after_comma_digits = ((t * 100.0) as u16) % 100;
                 display.set_position(COL_DATA, ROW_TEMP).unwrap();
                 let _ = display.write_str(s);
                 let _ = display.write_str(".");
                 let s = buffer.format(after_comma_digits);
                 let _ = display.write_str(s);
-                let _ = display.write_str(" ");    
+                let _ = display.write_str(" ");
                 let now = Instant::now();
                 let s: &str = buffer.format(now.as_millis());
                 display.set_position(COL_DATA, ROW_TIME).unwrap();
@@ -157,7 +156,7 @@ async fn core1_task(mut led: Output<'static>, i2c0: embassy_rp::i2c::I2c<'static
                 let s: &str = buffer.format(counter);
                 display.set_position(COL_DATA, ROW_COUNTER).unwrap();
                 let _ = display.write_str(s);
-                counter += 1;                
+                counter += 1;
             }
         }
     }
